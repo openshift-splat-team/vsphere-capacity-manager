@@ -1,0 +1,346 @@
+#!/usr/bin/env python
+
+import argparse
+import json
+import os
+import copy
+import subprocess
+import tempfile
+
+def run_executable(*argv):
+    result = subprocess.run(argv, capture_output=True, text=True)
+    return result.stdout
+
+def getPools():
+    output = run_executable("oc", "get", "pools", "-n", "vsphere-infra-helpers", "-o", "json")
+    return(json.loads(output)['items'])
+
+def getLeases():
+    output = run_executable("oc", "get", "leases.vspherecapacitymanager.splat.io", "-n", "vsphere-infra-helpers", "-o", "json")
+    return(json.loads(output)['items'])
+
+def getNetworks():
+    output = run_executable("oc", "get", "networks.vspherecapacitymanager.splat.io", "-n", "vsphere-infra-helpers", "-o", "json")
+    return(json.loads(output)['items'])
+
+def applyManifest(manifestPath):
+    print(run_executable("oc", "apply", "-f", manifestPath))
+    
+def getPool(poolName):
+    pools = getPools() 
+    for pool in pools:
+        if pool["metadata"]["name"] == poolName:
+            return pool
+    print("pool " + poolName + " was not found")
+    os._exit(1)    
+
+def getNetwork(networkName):
+    networks = getNetworks() 
+    for network in networks:
+        if network["metadata"]["name"] == networkName:
+            return network
+    print("network " + networkName + " was not found")
+    os._exit(1)    
+
+def setNetworkType(network, networkType):
+    run_executable("oc", "label", "--overwrite", "networks.vspherecapacitymanager.splat.io", "-n", "vsphere-infra-helpers", network, "vsphere-capacity-manager.splat-team.io/network-type="+networkType)
+
+def applyPool(pool):    
+    # Create a temporary file
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as temp_file:
+        # Write JSON data to the temporary file
+        json.dump(pool, temp_file)        
+
+    output = run_executable("oc", "apply", "-f", os.path.abspath(temp_file.name))
+    print(output)
+
+def getNetworkType(network):
+    gotType = False
+    if "labels" in network["metadata"]:            
+        labels = network["metadata"]["labels"]        
+        if "vsphere-capacity-manager.splat-team.io/network-type" in labels:
+            return labels["vsphere-capacity-manager.splat-team.io/network-type"]                
+    return "single-tenant"
+
+def getNetworkCounts():
+    singleTenant = 0
+    multiTenant = 0
+    networks = getNetworks()
+    for network in networks:
+        if getNetworkType(network) == "multi-tenant":
+            multiTenant += 1
+        else:
+            singleTenant += 1
+    return singleTenant, multiTenant
+
+def getLeaseStatus():    
+    singleTenant = 0
+    multiTenant = 0
+    singleTenantPending = 0
+    multiTenantPending = 0
+    count = 0
+    pending = 0
+    leases = getLeases()
+    for lease in leases:
+        count += 1
+        if lease["spec"]["network-type"] == "multi-tenant":
+            multiTenant += 1
+            if lease["status"]["phase"] == "Pending":
+                multiTenantPending += 1
+        else:
+            singleTenant += 1
+            if lease["status"]["phase"] == "Pending":
+                singleTenantPending += 1            
+        
+    return count, pending, singleTenant, multiTenant, singleTenantPending, multiTenantPending
+
+def printStatus():
+    singleTenantCount, multiTenantCount = getNetworkCounts()
+    nameMaxLen = 0    
+    for pool in getPools():
+        nameLen = len(pool["metadata"]["name"])
+        if nameLen > nameMaxLen:
+            nameMaxLen = nameLen
+    nameMaxLen += 3
+    cordonLen = len("cordoned") + 2
+    excludedLen = len("excluded") + 2
+    usageLen = 20
+    header = "+".ljust(nameMaxLen,"-") + "+".ljust(usageLen,"-") + "+".ljust(cordonLen+1, "-") + "+".ljust(excludedLen+1, "-") + "+"        
+    print(header)
+    print("| Pool Name".ljust(nameMaxLen) + "| Avail Capacity".ljust(usageLen) + "| Cordoned".ljust(cordonLen+1) + "| Excluded".ljust(excludedLen+1) + "|")
+    print(header)
+    header = "+".ljust(nameMaxLen,"-") + "+".ljust(usageLen,"-") + "+".ljust(cordonLen+1, "-") + "+".ljust(excludedLen+1, "-") + "+"    
+    for pool in getPools():        
+        cpuUsage    = "CPU: " + format((pool["status"]["vcpus-available"] / pool["spec"]["vcpus"]), ".0%")
+        memoryUsage = "Memory: " + format((pool["status"]["memory-available"] / pool["spec"]["memory"]), ".0%")
+        networkUsage = "Network: " + format(pool["status"]["network-available"] / len(pool["spec"]["topology"]["networks"]), ".0%")
+        print("| " + pool["metadata"]["name"].ljust(nameMaxLen-2) + "| " + cpuUsage.ljust(usageLen-2) + "| " + str(pool["spec"]["noSchedule"]).ljust(cordonLen-1) + "| " + str(pool["spec"]["exclude"]) .ljust(excludedLen-1) + "|")
+        print("| ".ljust(nameMaxLen) + "| " + memoryUsage.ljust(usageLen-2) + "| ".ljust(cordonLen-1) + "  | ".ljust(excludedLen) + "   |")
+        print("| ".ljust(nameMaxLen) + "| " + networkUsage.ljust(usageLen-2) + "| ".ljust(cordonLen-1) + "  | ".ljust(excludedLen) + "   |")
+        print(header)        
+
+    leaseCount, pendingLeases, singleTenantUsage, multiTenantUsage, singleTenantPending, multiTenantPending = getLeaseStatus()
+
+    print("\nLease Count: " + str(leaseCount) + ", single-tenant usage: " + str(format(singleTenantUsage / singleTenantCount, ".0%")) + ", multi-tenant usage: " + str(format(multiTenantUsage / multiTenantCount, ".0%")))
+    print("Pending Leases: " + str(pendingLeases) + ", pending single-tenant: " + str(singleTenantPending) + ", pending multi-tenant: " + str(multiTenantPending))
+
+def dropPortGroupFromPools(portGroup, poolName):
+    if poolName == "":
+        pools = getPools()
+        for pool in pools:
+            dropPortGroupFromPool(portGroup, pool["metadata"]["name"])
+    else:
+        dropPortGroupFromPool(portGroup, poolName)
+
+def dropPortGroupFromPool(portGroup, poolName):
+    networks = []
+    pool = getPool(poolName)    
+
+    for network in pool["spec"]["topology"]["networks"]:
+        if network.endswith("ci-vlan-"+portGroup): 
+            print("dropping portgroup " + portGroup + " from pool " + poolName)
+            continue
+        networks.append(network)
+        
+    pool["spec"]["topology"]["networks"] = networks
+    applyPool(pool)
+    return pool
+
+def addPortGroupToPools(portGroup, poolName):
+    if poolName == "":
+        pools = getPools()
+        for pool in pools:
+            if pool["spec"]["noSchedule"] or pool["spec"]["exclude"]:
+                continue
+            addPortGroupToPool(portGroup, pool["metadata"]["name"])
+    else:
+        addPortGroupToPool(portGroup, poolName)
+
+def addPortGroupToPool(portGroup, poolName):
+    networks = []
+    exists = False    
+
+    pool = getPool(poolName)
+
+    print("adding portgroup " + portGroup + " to pool " + poolName)
+    for network in pool["spec"]["topology"]["networks"]:
+        if network.endswith("ci-vlan-"+portGroup): 
+            print("portgroup " + portGroup + " already exists in pool " + pool["metadata"]["name"])
+            exists = True
+            continue
+        networks.append(network)
+    if not exists:
+        networks.append("/" + pool["spec"]["topology"]["datacenter"] + "/network/ci-vlan-"+portGroup )
+    
+    pool["spec"]["topology"]["networks"] = networks
+    applyPool(pool)
+    return pool
+
+def cordonPool(poolName):
+    pool = getPool(poolName)
+    pool["spec"]["noSchedule"] = True
+    applyPool(pool)
+    return pool
+
+def uncordonPool(poolName):
+    pool = getPool(poolName)
+    pool["spec"]["noSchedule"] = False
+    applyPool(pool)
+    return pool
+
+def excludePool(poolName):
+    pool = getPool(poolName)
+    pool["spec"]["exclude"] = True
+    applyPool(pool)
+    return pool
+
+def includePool(poolName):
+    pool = getPool(poolName)
+    pool["spec"]["exclude"] = False
+    applyPool(pool)
+    return pool
+
+def setCapacity(poolName, cpu=None, memory=None):
+    pool = getPool(poolName)
+    if cpu != None:
+        print("setting vcpus to " + str(cpu) + " for pool " + pool["metadata"]["name"])
+        pool["spec"]["vcpus"] = int(cpu)
+    if memory != None:
+        print("setting memory to " + str(memory) + " for pool " + pool["metadata"]["name"])
+        pool["spec"]["memory"] = int(memory)
+    applyPool(pool)
+    return pool
+
+def listNetworks():
+    nameMaxLen = 0
+    networks = getNetworks()
+    for network in networks:
+        nameLen = len(network["metadata"]["name"])
+        if nameLen > nameMaxLen:
+            nameMaxLen = nameLen
+    nameMaxLen += 3
+    networkTypeLen = len("Network Type") + 2
+    cidrLen = 20
+    
+    header = "+".ljust(nameMaxLen+2,"-") + "+".ljust(networkTypeLen+2,"-") + "+".ljust(cidrLen+3, "-") + "+"
+    print(header)
+    print("| Network Name".ljust(nameMaxLen+2) + "| Network Type".ljust(networkTypeLen+2) + "| CIDR".ljust(cidrLen+3) + "|")
+    print(header)
+    for network in networks:
+        print("| " + network["metadata"]["name"].ljust(nameMaxLen) + "| " + getNetworkType(network).ljust(networkTypeLen) + "| " + network["spec"]["machineNetworkCidr"].ljust(cidrLen+1) + "|")
+    print(header)
+
+def splitNetwork(name, networkCount):
+    y = getNetwork(name)
+
+    print("updating network type to multi-tenant for " + name)
+    setNetworkType(name, "mutli-tenant")
+
+    if "labels" in y["metadata"]:
+        labels = y["metadata"]["labels"]
+        if "vsphere-capacity-manager.splat-team.io/network-type" in labels:
+            if labels["vsphere-capacity-manager.splat-team.io/network-type"] == "multi-tenant":
+                print("network is already multi-tenant")
+               # return
+
+    gateway = y["spec"]["gateway"]
+    addressCount = y["spec"]["ipAddressCount"]
+
+    y["spec"]["ipAddresses"] = []
+    ipParts = gateway.split(".")
+    for idx in range (0, addressCount):
+        y["spec"]["ipAddresses"].append(str(ipParts[0])+"."+str(ipParts[1])+"."+str(ipParts[2])+"."+str(idx))
+    
+    for idx in range (1, networkCount+1):
+        new_network = copy.deepcopy(y)
+        new_network["metadata"]["name"] = y["metadata"]["name"]+"-multi-"+str(idx)
+        new_network["metadata"]["labels"] = {"vsphere-capacity-manager.splat-team.io/network-type": "multi-tenant"}
+        new_network["spec"]["portGroupName"] += "-" + str(idx)
+        
+        slice_idx_start = 2 + ((idx - 1) * 2)
+        new_network["spec"]["ipAddresses"] = new_network["spec"]["ipAddresses"][slice_idx_start:slice_idx_start+4]
+        file_name = "/tmp/" + new_network["metadata"]["name"] + "-" + str(idx) + ".json"
+        with open(file_name, 'w', encoding='utf-8') as file:
+            print("writing " + file_name)
+            json.dump(new_network, file)
+        print("applying " + file_name)
+        applyManifest(file_name)
+
+def main():
+    parser = argparse.ArgumentParser(description="Process some commands.")
+    
+    # Adding subparsers for different commands
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    
+    # Cordon command
+    parser_cordon = subparsers.add_parser("cordon", help="Cordon a pool")
+    parser_cordon.add_argument("--pool", required=True, help="Specify the pool to cordon")
+    
+    # Uncordon command
+    parser_uncordon = subparsers.add_parser("uncordon", help="Uncordon a pool")
+    parser_uncordon.add_argument("--pool", required=True, help="Specify the pool to uncordon")
+    
+    # Exclude command
+    parser_exclude = subparsers.add_parser("exclude", help="Exclude a pool")
+    parser_exclude.add_argument("--pool", required=True, help="Specify the pool to exclude")
+    
+    # Include command
+    parser_include = subparsers.add_parser("include", help="Include a pool")
+    parser_include.add_argument("--pool", required=True, help="Specify the pool to include")
+    
+    # Set capacity command
+    parser_set_capacity = subparsers.add_parser("set-capacity", help="Set capacity")
+    parser_set_capacity.add_argument("--pool", required=True, help="Specify the pool to configure")
+    parser_set_capacity.add_argument("--cpu", type=int, help="Set the CPU capacity")
+    parser_set_capacity.add_argument("--memory", type=int, help="Set the memory capacity")
+    
+    # Add VLAN command
+    parser_add_vlan = subparsers.add_parser("add-vlan", help="Add VLAN")
+    parser_add_vlan.add_argument("--vlan", type=str, required=True, help="Specify VLAN ID")
+    parser_add_vlan.add_argument("--pool", default="", help="Specify the pool to for which the VLAN is to be added. If undefined, VLAN will be added to all uncordoned, unexcluded pools.")
+    
+    # Drop VLAN command
+    parser_drop_vlan = subparsers.add_parser("drop-vlan", help="Drop VLAN")
+    parser_drop_vlan.add_argument("--vlan", type=str, required=True, help="Specify VLAN ID")
+    parser_drop_vlan.add_argument("--pool", default="", help="Specify the pool to for which the VLAN is to be dropped. If undefined, VLAN will be dropped from all uncordoned, unexcluded pools.")
+
+    parser_status = subparsers.add_parser("status", help="Get status of the capacity manager")
+
+
+    parser_networks = subparsers.add_parser("networks", help="List networks")
+    
+    parser_split_network = subparsers.add_parser("split-network", help="Split a network")
+    parser_split_network.add_argument("--network", required=True, help="Specify the network to split")
+    parser_split_network.add_argument("--subnets", type=int, required=True, help="Specify the number of subnets to create")
+    
+    args = parser.parse_args()
+    
+    if args.command == "cordon":
+        cordonPool(args.pool)
+    elif args.command == "uncordon":
+        uncordonPool(args.pool)
+    elif args.command == "exclude":
+        excludePool(args.pool)
+    elif args.command == "include":
+        includePool(args.pool)
+    elif args.command == "set-capacity":
+        if args.cpu is not None or args.memory is not None:
+            setCapacity(args.pool, cpu=args.cpu, memory=args.memory)
+        else:
+            print("Error: At least one of --cpu or --memory is required for set-capacity command")
+    elif args.command == "add-vlan":
+        addPortGroupToPools(args.vlan, args.pool)
+    elif args.command == "drop-vlan":
+        dropPortGroupFromPools(args.vlan, args.pool)
+    elif args.command == "status":
+        printStatus()
+    elif args.command == "networks":
+        listNetworks()
+    elif args.command == "split-network":
+        splitNetwork(args.network, args.subnets)        
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
+

@@ -24,7 +24,7 @@ def getNetworks():
     return(json.loads(output)['items'])
 
 def applyManifest(manifestPath):
-    run_executable("oc", "apply", "-f", manifestPath)
+    print(run_executable("oc", "apply", "-f", manifestPath))
     
 def getPool(poolName):
     pools = getPools() 
@@ -241,23 +241,30 @@ def splitNetwork(name, networkCount):
         if "vsphere-capacity-manager.splat-team.io/network-type" in labels:
             if labels["vsphere-capacity-manager.splat-team.io/network-type"] == "multi-tenant":
                 print("network is already multi-tenant")
-                return
+               # return
 
-    for idx in range (1, networkCount):
+    gateway = y["spec"]["gateway"]
+    addressCount = y["spec"]["ipAddressCount"]
+
+    y["spec"]["ipAddresses"] = []
+    ipParts = gateway.split(".")
+    for idx in range (0, addressCount):
+        y["spec"]["ipAddresses"].append(str(ipParts[0])+"."+str(ipParts[1])+"."+str(ipParts[2])+"."+str(idx))
+    
+    for idx in range (1, networkCount+1):
         new_network = copy.deepcopy(y)
-        new_network["metadata"]["generateName"] = y["metadata"]["name"]
+        new_network["metadata"]["name"] = y["metadata"]["name"]+"-multi-"+str(idx)
         new_network["metadata"]["labels"] = {"vsphere-capacity-manager.splat-team.io/network-type": "multi-tenant"}
         new_network["spec"]["portGroupName"] += "-" + str(idx)
         
         slice_idx_start = 2 + ((idx - 1) * 2)
         new_network["spec"]["ipAddresses"] = new_network["spec"]["ipAddresses"][slice_idx_start:slice_idx_start+4]
-
-        file_name = "/tmp/" + new_network["metadata"]["name"] + ".json"
+        file_name = "/tmp/" + new_network["metadata"]["name"] + "-" + str(idx) + ".json"
         with open(file_name, 'w', encoding='utf-8') as file:
             print("writing " + file_name)
-            file.write(json.safe_dump(new_network))
-            print("applying " + file_name)
-            applyManifest(file_name)
+            json.dump(new_network, file)
+        print("applying " + file_name)
+        applyManifest(file_name)
 
 def main():
     parser = argparse.ArgumentParser(description="Process some commands.")
